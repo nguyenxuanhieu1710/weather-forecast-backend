@@ -1,0 +1,10 @@
+# Bỏ môi trường ảo
+.venv/
+
+# Bỏ file cache Python
+__pycache__/
+*.pyc
+
+# Bỏ file môi trường riêng
+.env
+backend/data/*.tif
