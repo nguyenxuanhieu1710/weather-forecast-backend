@@ -7,32 +7,110 @@ from django.http import JsonResponse, HttpResponseBadRequest
 from django.db import connection
 from django.utils import timezone
 
+FCST_PROVIDER = "ML"
+
+# ===== MULTI-PROVIDER CONFIG =====
+ALLOWED_PROVIDERS = ("ML",)   # hiện tại hệ thống bạn đang dùng 1 provider là ML
+DEFAULT_PROVIDER = "ML"
+
 
 def latest_snapshot(request):
     """
-    Trả về bản ghi mới nhất của MỖI điểm (đọc từ MV latest_openmeteo_hourly)
-    cho heatmap / frontend.
+    Trả về snapshot giờ hiện tại cho MỖI điểm, nhưng JSON giữ y hệt schema cũ.
+
+    Logic:
+      - Giờ chuẩn: base_utc = now UTC, floored về đầu giờ.
+      - Với mỗi location:
+          + Nếu có OBS (weather_hourly_obs, source='openmeteo', valid_at=base_utc)
+            → dùng OBS.
+          + Nếu KHÔNG có OBS nhưng có FCST (weather_hourly_fcst, provider='ML',
+            valid_at=base_utc) → dùng FCST.
+          + Nếu cả hai đều không có → không trả điểm đó.
     """
+    now_utc = timezone.now().astimezone(dt_timezone.utc)
+    base_utc = now_utc.replace(minute=0, second=0, microsecond=0)
+
     limit = int(request.GET.get("limit") or 0)  # optional
 
     sql = """
+      WITH base_hour AS (
+        SELECT %s::timestamptz AS vt
+      ),
+      obs AS (
+        SELECT
+          l.id AS location_id,
+          l.lat,
+          l.lon,
+          w.valid_at,
+          w.temp_c,
+          w.wind_ms,
+          w.precip_mm,
+          w.wind_dir_deg,
+          w.rel_humidity_pct,
+          w.cloudcover_pct,
+          w.surface_pressure_hpa
+        FROM base_hour b
+        JOIN public.weather_hourly_obs w
+          ON w.valid_at = b.vt
+         AND w.source = 'openmeteo'
+        JOIN public.locations l
+          ON l.id = w.location_id
+      ),
+      fcst_only AS (
+        -- Chỉ lấy FCST giờ base_utc cho các điểm KHÔNG có OBS
+        SELECT
+          l.id AS location_id,
+          l.lat,
+          l.lon,
+          f.valid_at,
+          f.temp_c,
+          f.wind_ms,
+          f.precip_mm,
+          f.wind_dir_deg,
+          f.rel_humidity_pct,
+          f.cloudcover_pct,
+          f.surface_pressure_hpa
+        FROM base_hour b
+        JOIN public.weather_hourly_fcst f
+          ON f.valid_at = b.vt
+         AND f.provider = %s
+        JOIN public.locations l
+          ON l.id = f.location_id
+        LEFT JOIN obs o
+          ON o.location_id = l.id
+        WHERE o.location_id IS NULL
+      )
       SELECT
-        l.id,
-        l.lat,
-        l.lon,
-        w.valid_at,
-        w.temp_c,
-        w.wind_ms,
-        w.precip_mm,
-        w.wind_dir_deg,
-        w.rel_humidity_pct,
-        w.cloudcover_pct,
-        w.surface_pressure_hpa
-      FROM public.latest_openmeteo_hourly w
-      JOIN public.locations l ON l.id = w.location_id
-      ORDER BY w.valid_at DESC, l.lat, l.lon
+        location_id,
+        lat,
+        lon,
+        valid_at,
+        temp_c,
+        wind_ms,
+        precip_mm,
+        wind_dir_deg,
+        rel_humidity_pct,
+        cloudcover_pct,
+        surface_pressure_hpa
+      FROM obs
+      UNION ALL
+      SELECT
+        location_id,
+        lat,
+        lon,
+        valid_at,
+        temp_c,
+        wind_ms,
+        precip_mm,
+        wind_dir_deg,
+        rel_humidity_pct,
+        cloudcover_pct,
+        surface_pressure_hpa
+      FROM fcst_only
+      ORDER BY valid_at DESC, lat, lon
     """
-    params = []
+    params = [base_utc, FCST_PROVIDER]
+
     if limit > 0:
         sql += " LIMIT %s"
         params.append(limit)
@@ -68,16 +146,15 @@ def merged_timeseries(request, location_id):
     Chuỗi thời gian MERGED cho 1 điểm: 48h quá khứ + 96h tương lai (mặc định).
 
     - Quá khứ: ưu tiên OBS (weather_hourly_obs, source='openmeteo')
-    - Tương lai: dùng FCST (weather_hourly_fcst) nếu có
+    - Nếu giờ nào OBS bị thiếu (kể cả quá khứ/hiện tại) -> fallback FCST (weather_hourly_fcst, provider='ML')
+    - Tương lai: dùng FCST (provider='ML')
     - Nếu giờ nào không có cả OBS lẫn FCST -> source = "none"
     """
-    # validate UUID
     try:
         UUID(str(location_id))
     except Exception:
         return HttpResponseBadRequest("invalid location_id")
 
-    # Lấy info location (id, name, lat, lon)
     with connection.cursor() as cur:
         cur.execute(
             """
@@ -99,7 +176,6 @@ def merged_timeseries(request, location_id):
         "lon": float(loc_row[3]),
     }
 
-    # Đọc tham số back/fwd/provider
     try:
         back_hours = int(request.GET.get("back") or 48)
     except Exception:
@@ -118,9 +194,8 @@ def merged_timeseries(request, location_id):
     if fwd_hours > 168:
         fwd_hours = 168
 
-    provider = (request.GET.get("provider") or "ml").strip() or "ml"
+    provider = FCST_PROVIDER
 
-    # Giờ "base" = now UTC floored về đầu giờ
     now_utc = timezone.now().astimezone(dt_timezone.utc)
     base_utc = now_utc.replace(minute=0, second=0, microsecond=0)
 
@@ -241,6 +316,7 @@ def merged_timeseries(request, location_id):
             "base_time": base_utc.isoformat(),
             "back_hours": back_hours,
             "forward_hours": fwd_hours,
+            "provider": provider,
             "count": len(steps),
             "steps": steps,
         }
@@ -305,7 +381,15 @@ def nearest_point(request):
 
 def rain_frames(request):
     """
-    Radar mưa giả lập: trả nhiều frame mưa ở các mốc thời gian mới nhất.
+    Radar mưa (past -> now), MERGED per-location:
+
+    Mục tiêu đúng theo yêu cầu:
+      - Neo theo base_utc (giờ hiện tại, làm tròn theo giờ).
+      - Frames chạy từ quá khứ tới hiện tại: [base_utc-(n-1)h .. base_utc]
+      - Ở MỖI (location_id, valid_at):
+          + Ưu tiên OBS (openmeteo) nếu tồn tại đúng giờ
+          + Nếu không có OBS đúng giờ => fallback FCST (provider=ML) đúng giờ
+          + Nếu cả hai không có => bỏ cell (precip_mm NULL)
     """
     try:
         n_frames = int(request.GET.get("frames") or 6)
@@ -317,46 +401,88 @@ def rain_frames(request):
     if n_frames > 24:
         n_frames = 24
 
+    now_utc = timezone.now().astimezone(dt_timezone.utc)
+    base_utc = now_utc.replace(minute=0, second=0, microsecond=0)
+
+    # past -> now: n_frames mốc, bao gồm base_utc
+    start_utc = base_utc - timedelta(hours=(n_frames - 1))
+
     with connection.cursor() as cur:
         cur.execute(
             """
-            WITH latest_times AS (
-              SELECT DISTINCT valid_at
-              FROM public.weather_hourly_obs
-              WHERE source = 'openmeteo'
-              ORDER BY valid_at DESC
-              LIMIT %s
+            WITH
+            params AS (
+              SELECT
+                %s::timestamptz AS start_t,
+                %s::timestamptz AS end_t,
+                %s::text        AS provider
+            ),
+            times AS (
+              SELECT generate_series(
+                (SELECT start_t FROM params),
+                (SELECT end_t   FROM params),
+                interval '1 hour'
+              ) AS valid_at
+            ),
+            grid AS (
+              SELECT id, lat, lon
+              FROM public.locations
+              WHERE active = true
+            ),
+            obs AS (
+              SELECT
+                w.location_id,
+                w.valid_at,
+                w.precip_mm
+              FROM public.weather_hourly_obs w
+              WHERE w.source = 'openmeteo'
+                AND w.valid_at >= (SELECT start_t FROM params)
+                AND w.valid_at <= (SELECT end_t   FROM params)
+            ),
+            fcst AS (
+              SELECT
+                f.location_id,
+                f.valid_at,
+                f.precip_mm
+              FROM public.weather_hourly_fcst f
+              WHERE f.provider = (SELECT provider FROM params)
+                AND f.valid_at >= (SELECT start_t FROM params)
+                AND f.valid_at <= (SELECT end_t   FROM params)
+            ),
+            merged AS (
+              SELECT
+                t.valid_at,
+                g.lat,
+                g.lon,
+                COALESCE(o.precip_mm, f.precip_mm) AS precip_mm
+              FROM times t
+              CROSS JOIN grid g
+              LEFT JOIN obs  o
+                ON o.location_id = g.id
+               AND o.valid_at    = t.valid_at
+              LEFT JOIN fcst f
+                ON f.location_id = g.id
+               AND f.valid_at    = t.valid_at
+               AND o.location_id IS NULL   -- chỉ dùng FCST nếu OBS thiếu tại location đó
             )
             SELECT
-              w.valid_at,
-              l.lat,
-              l.lon,
-              w.precip_mm
-            FROM public.weather_hourly_obs w
-            JOIN public.locations l
-              ON l.id = w.location_id
-            JOIN latest_times t
-              ON t.valid_at = w.valid_at
-            WHERE w.source = 'openmeteo'
-            ORDER BY w.valid_at ASC, l.lat, l.lon;
+              valid_at, lat, lon, precip_mm
+            FROM merged
+            WHERE precip_mm IS NOT NULL
+            ORDER BY valid_at ASC, lat, lon;
             """,
-            [n_frames],
+            [start_utc, base_utc, FCST_PROVIDER],
         )
         rows = cur.fetchall()
 
     frames_map = {}
     for valid_at, lat, lon, precip in rows:
-        if precip is None:
-            continue
         try:
             p = float(precip)
         except Exception:
             continue
 
-        key = valid_at
-        if key not in frames_map:
-            frames_map[key] = []
-        frames_map[key].append(
+        frames_map.setdefault(valid_at, []).append(
             {
                 "lat": float(lat),
                 "lon": float(lon),
@@ -364,139 +490,16 @@ def rain_frames(request):
             }
         )
 
+    # đảm bảo trả đủ frame theo trục thời gian (kể cả frame rỗng)
     frames = []
-    for ts in sorted(frames_map.keys()):
-        cells = frames_map[ts]
+    cursor = start_utc
+    while cursor <= base_utc:
         frames.append(
             {
-                "valid_at": ts.isoformat(),
-                "cells": cells,
+                "valid_at": cursor.isoformat(),
+                "cells": frames_map.get(cursor, []),
             }
         )
+        cursor += timedelta(hours=1)
 
-    data = {
-        "frame_count": len(frames),
-        "frames": frames,
-    }
-    return JsonResponse(data)
-
-
-def wind_trajectory(request):
-    """
-    Dự đoán quỹ đạo gió đơn giản từ 1 vị trí,
-    dùng trường gió hiện tại (trung bình từ các điểm lân cận).
-    """
-    try:
-        lat0 = float(request.GET["lat"])
-        lon0 = float(request.GET["lon"])
-    except Exception:
-        return HttpResponseBadRequest("need lat & lon")
-
-    try:
-        hours = int(request.GET.get("hours") or 6)
-    except Exception:
-        return HttpResponseBadRequest("invalid hours")
-
-    if hours < 1:
-        hours = 1
-    if hours > 24:
-        hours = 24
-
-    with connection.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-              l.lat,
-              l.lon,
-              w.wind_ms,
-              w.wind_dir_deg
-            FROM public.locations l
-            JOIN public.latest_openmeteo_hourly w
-              ON w.location_id = l.id
-            ORDER BY l.geom <-> ST_SetSRID(ST_Point(%s,%s), 4326)
-            LIMIT 10
-            """,
-            [lon0, lat0],
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        return JsonResponse({"found": False})
-
-    sum_u = 0.0
-    sum_v = 0.0
-    cnt = 0
-
-    for lat, lon, wind_ms, wind_dir_deg in rows:
-        if wind_ms is None or wind_dir_deg is None:
-            continue
-        try:
-            spd = float(wind_ms)
-            ddeg = float(wind_dir_deg)
-        except Exception:
-            continue
-
-        if spd <= 0:
-            continue
-
-        rad = math.radians(ddeg)
-        u = spd * math.sin(rad)
-        v = spd * math.cos(rad)
-
-        sum_u += u
-        sum_v += v
-        cnt += 1
-
-    if cnt == 0:
-        return JsonResponse({"found": False})
-
-    mean_u = sum_u / cnt
-    mean_v = sum_v / cnt
-
-    mean_speed = math.sqrt(mean_u**2 + mean_v**2)
-    mean_dir_rad = math.atan2(mean_u, mean_v)
-    mean_dir_deg = (math.degrees(mean_dir_rad) + 360.0) % 360.0
-
-    step_hours = 1.0
-    steps = hours
-
-    points = []
-    lat = lat0
-    lon = lon0
-
-    for i in range(steps + 1):
-        points.append(
-            {
-                "lat": float(lat),
-                "lon": float(lon),
-                "t_offset_h": i * step_hours,
-            }
-        )
-
-        if i == steps:
-            break
-
-        dt_seconds = step_hours * 3600.0
-        d_north_m = mean_v * dt_seconds
-        d_east_m = mean_u * dt_seconds
-
-        dlat_deg = d_north_m / 111000.0
-        lat_rad = math.radians(lat)
-        cos_lat = math.cos(lat_rad)
-        if abs(cos_lat) < 1e-6:
-            cos_lat = 1e-6
-        dlon_deg = d_east_m / (111000.0 * cos_lat)
-
-        lat += dlat_deg
-        lon += dlon_deg
-
-    data = {
-        "found": True,
-        "start": {"lat": float(lat0), "lon": float(lon0)},
-        "hours": hours,
-        "step_hours": step_hours,
-        "mean_wind_ms": mean_speed,
-        "mean_dir_deg": mean_dir_deg,
-        "points": points,
-    }
-    return JsonResponse(data)
+    return JsonResponse({"frame_count": len(frames), "frames": frames})

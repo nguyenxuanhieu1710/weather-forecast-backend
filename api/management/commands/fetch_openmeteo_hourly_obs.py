@@ -1,7 +1,6 @@
 # api/management/commands/fetch_openmeteo_hourly_obs.py
 import os
 import time
-import json
 import math
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,20 +30,17 @@ order by lat, lon;
 # temp_c double precision, wind_ms double precision, precip_mm double precision,
 # wind_dir_deg double precision, rel_humidity_pct double precision,
 # cloudcover_pct double precision, surface_pressure_hpa double precision,
-# raw jsonb,
 # UNIQUE(location_id, valid_at, source)
 SQL_UPSERT_HOURLY_OBS = """
 insert into public.weather_hourly_obs
 (id, location_id, valid_at, source,
  temp_c, wind_ms, precip_mm,
  wind_dir_deg, rel_humidity_pct,
- cloudcover_pct, surface_pressure_hpa,
- raw)
+ cloudcover_pct, surface_pressure_hpa)
 values (gen_random_uuid(), %s, %s, 'openmeteo',
         %s, %s, %s,
         %s, %s,
-        %s, %s,
-        %s)
+        %s, %s)
 on conflict (location_id, valid_at, source) do update set
   temp_c               = excluded.temp_c,
   wind_ms              = excluded.wind_ms,
@@ -52,8 +48,7 @@ on conflict (location_id, valid_at, source) do update set
   wind_dir_deg         = excluded.wind_dir_deg,
   rel_humidity_pct     = excluded.rel_humidity_pct,
   cloudcover_pct       = excluded.cloudcover_pct,
-  surface_pressure_hpa = excluded.surface_pressure_hpa,
-  raw                  = excluded.raw;
+  surface_pressure_hpa = excluded.surface_pressure_hpa;
 """
 
 
@@ -82,6 +77,25 @@ def _safe_float(v):
         return float(v)
     except Exception:
         return None
+
+
+def _ensure_9_params(row, bi=None, loc_id=None):
+    """
+    SQL_UPSERT_HOURLY_OBS có đúng 9 placeholders.
+    Nếu row không đúng 9 phần tử -> báo lỗi rõ ràng để biết thừa/thiếu ở đâu.
+    """
+    if row is None:
+        raise ValueError(f"[DB] row is None (batch={bi}, loc={loc_id})")
+
+    if not isinstance(row, (tuple, list)):
+        raise ValueError(f"[DB] row type invalid={type(row)} (batch={bi}, loc={loc_id}) row={row!r}")
+
+    if len(row) != 9:
+        raise ValueError(
+            f"[DB] invalid param length={len(row)} expected=9 (batch={bi}, loc={loc_id}) row={row!r}"
+        )
+
+    return tuple(row)
 
 
 class Command(BaseCommand):
@@ -302,27 +316,20 @@ class Command(BaseCommand):
                     cloud_pct = _safe_float(clouds[k]) if k < len(clouds) else None
                     sp_hpa = _safe_float(press[k]) if k < len(press) else None
 
-                    raw_extra = {
-                        "cloudcover": cloud_pct,
-                        "surface_pressure": sp_hpa,
-                        "relative_humidity_2m": rh_pct,
-                        "wind_direction_10m": wdir_deg,
-                    }
-
-                    rows.append(
-                        (
-                            loc_id,
-                            tdt,
-                            temp_c,
-                            wind_ms,
-                            precip,
-                            wdir_deg,
-                            rh_pct,
-                            cloud_pct,
-                            sp_hpa,
-                            json.dumps(raw_extra, ensure_ascii=False),
-                        )
+                    row = (
+                        loc_id,    # %s 1
+                        tdt,       # %s 2
+                        temp_c,    # %s 3
+                        wind_ms,   # %s 4
+                        precip,    # %s 5
+                        wdir_deg,  # %s 6
+                        rh_pct,    # %s 7
+                        cloud_pct, # %s 8
+                        sp_hpa,    # %s 9
                     )
+
+                    # đảm bảo đúng 9 params (nếu không đúng sẽ nổ rõ ràng tại đây)
+                    rows.append(_ensure_9_params(row, bi=bi, loc_id=loc_id))
 
             sess.close()
             return bi, batch, rows, None
@@ -362,9 +369,7 @@ class Command(BaseCommand):
                 self.stderr.write(f"[?/?] ERR batch (no index): {err}")
                 continue
 
-            self.stdout.write(
-                f"[{bi}/{total_batches}] START batch | points={len(batch) if batch else 0}"
-            )
+            self.stdout.write(f"[{bi}/{total_batches}] START batch | points={len(batch) if batch else 0}")
 
             if err:
                 self.stderr.write(f"[{bi}/{total_batches}] ERR batch: {err}")
@@ -375,6 +380,9 @@ class Command(BaseCommand):
                     f"[{bi}/{total_batches}] No rows in window | batch_size={len(batch) if batch else 0}"
                 )
                 continue
+
+            # (tuỳ chọn) kiểm tra nhanh 1 row đầu để chắc chắn
+            _ = _ensure_9_params(rows[0], bi=bi, loc_id=rows[0][0] if rows[0] else None)
 
             num_rows = len(rows)
             num_chunks = max(1, math.ceil(num_rows / DB_CHUNK_SIZE))
@@ -399,9 +407,7 @@ class Command(BaseCommand):
 
                 inserted_here += len(sub)
 
-            self.stdout.write(
-                f"[{bi}/{total_batches}] DONE INSERT rows={inserted_here}"
-            )
+            self.stdout.write(f"[{bi}/{total_batches}] DONE INSERT rows={inserted_here}")
 
             ok_batches += 1
             total_rows += inserted_here
@@ -425,9 +431,7 @@ class Command(BaseCommand):
                     [cutoff],
                 )
                 deleted = cur.rowcount or 0
-            self.stdout.write(
-                f"[PRUNE] Done. deleted {deleted} rows older than {cutoff.isoformat()}"
-            )
+            self.stdout.write(f"[PRUNE] Done. deleted {deleted} rows older than {cutoff.isoformat()}")
 
         # --- 8) Refresh materialized views sau khi nạp xong ---
         if not o.get("no_refresh_mv"):

@@ -1,306 +1,298 @@
-# api/views_flood.py
+# api/views_flood_risk.py
+from __future__ import annotations
+
 import math
-from django.http import JsonResponse
+from datetime import timezone as dt_timezone
+
 from django.db import connection
+from django.http import JsonResponse
+from django.utils import timezone
 
-from .dem_utils import sample_relief_local
-
-EARTH_RADIUS_KM = 6371.0
+from api import dem_utils
 
 
-def _haversine_km(lat1, lon1, lat2, lon2):
+RISK_LEVELS = ["NONE", "LOW", "MEDIUM", "HIGH", "EXTREME"]
+
+
+# =========================
+# Helpers
+# =========================
+def _safe_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+# =========================
+# Effective rainfall
+# =========================
+def _effective_rain_1h(rain_1h: float) -> float:
+    return max(0.0, _safe_float(rain_1h))
+
+
+def _effective_rain_3h(rain_1h: float, rain_3h: float) -> float:
+    r1 = max(0.0, _safe_float(rain_1h))
+    r3 = max(0.0, _safe_float(rain_3h))
+    extra_3h = max(0.0, r3 - r1)
+    return max(0.0, r1 + 0.6 * extra_3h)
+
+
+def _effective_rain_6h(rain_1h: float, rain_3h: float, rain_6h: float) -> float:
+    r1 = max(0.0, _safe_float(rain_1h))
+    r3 = max(0.0, _safe_float(rain_3h))
+    r6 = max(0.0, _safe_float(rain_6h))
+    extra_3h = max(0.0, r3 - r1)
+    extra_6h = max(0.0, r6 - r3)
+    return max(0.0, r1 + 0.6 * extra_3h + 0.4 * extra_6h)
+
+
+# =========================
+# Bands (0..4)
+# =========================
+def _rain_band_from_eff6(eff_6h: float) -> int:
+    e = max(0.0, _safe_float(eff_6h))
+    if e < 0.5:
+        return 0
+    if e < 5:
+        return 1
+    if e < 15:
+        return 2
+    if e < 30:
+        return 3
+    return 4
+
+
+def _terrain_band_from_relief_local(relief_local_m: float) -> int:
     """
-    Khoảng cách great-circle giữa 2 điểm (độ) → km
+    relief_local = elev_center - local_min (>=0)
+    Relief càng nhỏ => càng sát đáy vùng trũng => rủi ro ngập càng cao.
+
+    Band 0..4:
+      - >= 30m: ít trũng (0)
+      - 10..30: (1)
+      - 3..10 : (2)
+      - 1..3  : (3)
+      - < 1   : cực trũng (4)
     """
-    lat1_rad = math.radians(lat1)
-    lon1_rad = math.radians(lon1)
-    lat2_rad = math.radians(lat2)
-    lon2_rad = math.radians(lon2)
-
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
-
-    a = (
-        math.sin(dlat / 2.0) ** 2
-        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2.0) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return EARTH_RADIUS_KM * c
+    r = max(0.0, _safe_float(relief_local_m, 1e9))
+    if r >= 30:
+        return 0
+    if r >= 10:
+        return 1
+    if r >= 3:
+        return 2
+    if r >= 1:
+        return 3
+    return 4
 
 
-def _add_neighborhood_rain(points, radius_km=20.0, neighbor_weight=0.5):
+def _elevation_band(elev_m: float) -> int:
     """
-    Tính thêm lượng mưa "hiệu dụng" có xét ảnh hưởng lân cận.
-
-    points: list[dict] với các keys:
-      - lat, lon
-      - rain_1h_mm, rain_3h_mm
-
-    Bổ sung:
-      - eff_rain_1h_mm
-      - eff_rain_3h_mm
+    Cao độ tuyệt đối thấp (đồng bằng ven biển) thường dễ ngập do thoát kém/triều/cửa sông.
+    Đây là yếu tố phụ (không lấn át mưa).
     """
-    n = len(points)
-    if n == 0:
-        return
-
-    for i in range(n):
-        pi = points[i]
-        lat_i = pi["lat"]
-        lon_i = pi["lon"]
-
-        sum_w = 0.0
-        sum_r1 = 0.0
-        sum_r3 = 0.0
-
-        for j in range(n):
-            if i == j:
-                continue
-            pj = points[j]
-            d_km = _haversine_km(lat_i, lon_i, pj["lat"], pj["lon"])
-            if d_km <= 0.0 or d_km > radius_km:
-                continue
-
-            w = 1.0 / (d_km + 1e-6)
-            sum_w += w
-            sum_r1 += pj["rain_1h_mm"] * w
-            sum_r3 += pj["rain_3h_mm"] * w
-
-        if sum_w > 0.0:
-            neigh_r1 = sum_r1 / sum_w
-            neigh_r3 = sum_r3 / sum_w
-        else:
-            neigh_r1 = 0.0
-            neigh_r3 = 0.0
-
-        pi["eff_rain_1h_mm"] = pi["rain_1h_mm"] + neighbor_weight * neigh_r1
-        pi["eff_rain_3h_mm"] = pi["rain_3h_mm"] + neighbor_weight * neigh_r3
+    e = _safe_float(elev_m, 99999.0)
+    if e < 5:
+        return 4
+    if e < 20:
+        return 3
+    if e < 80:
+        return 2
+    if e < 200:
+        return 1
+    return 0
 
 
-def _vulnerability_from_relief(relief_m):
+def _slope_like_penalty(slope_like_m: float) -> int:
     """
-    Độ cao tương đối (m) -> vulnerability 0..1
-
-    Relief nhỏ = gần đáy vùng trũng → dễ ngập hơn.
-
-    Ví dụ:
-      <= 1m    : 1.0
-      1–3m     : 0.9
-      3–7m     : 0.7
-      7–15m    : 0.5
-      15–30m   : 0.3
-      > 30m    : 0.1
+    slope_like: proxy độ dốc địa hình quanh điểm (m chênh trên bán kính nhỏ).
+    Dốc lớn -> ít ngập ứ đọng (nhưng có thể lũ quét). Ở đây chỉ giảm nhẹ risk ngập tĩnh.
     """
-    if relief_m is None or not math.isfinite(relief_m):
-        return 0.3  # không có dữ liệu, coi như trung bình thấp
-
-    if relief_m <= 1.0:
-        return 1.0
-    elif relief_m <= 3.0:
-        return 0.9
-    elif relief_m <= 7.0:
-        return 0.7
-    elif relief_m <= 15.0:
-        return 0.5
-    elif relief_m <= 30.0:
-        return 0.3
-    else:
-        return 0.1
+    s = max(0.0, _safe_float(slope_like_m, 0.0))
+    if s >= 80:
+        return 2
+    if s >= 30:
+        return 1
+    return 0
 
 
-def _rain_factor(rain_1h, rain_3h):
-    """
-    Chuẩn hóa mưa 1h, 3h về [0..1].
-    """
-    rain_1h = float(rain_1h or 0.0)
-    rain_3h = float(rain_3h or 0.0)
-
-    # Mưa 3h
-    if rain_3h <= 5:
-        r3 = 0.0
-    elif rain_3h <= 20:
-        r3 = 0.3 * (rain_3h - 5) / (20 - 5)
-    elif rain_3h <= 50:
-        r3 = 0.3 + 0.4 * (rain_3h - 20) / (50 - 20)
-    else:
-        extra = min(rain_3h - 50, 50)
-        r3 = 0.7 + 0.3 * (extra / 50.0)
-
-    # Mưa 1h
-    if rain_1h <= 5:
-        r1 = 0.0
-    elif rain_1h <= 20:
-        r1 = 0.6 * (rain_1h - 5) / (20 - 5)
-    elif rain_1h <= 50:
-        r1 = 0.6 + 0.3 * (rain_1h - 20) / (50 - 20)
-    else:
-        extra = min(rain_1h - 50, 50)
-        r1 = 0.9 + 0.1 * (extra / 50.0)
-
-    rf = 0.6 * r3 + 0.4 * r1
-    return max(0.0, min(1.0, rf))
-
-
-def _combine_rain_relief_to_score(relief_m, eff_rain_1h, eff_rain_3h):
+def _combined_risk_score(rain_band: int, relief_band: int, elev_band: int, slope_pen: int) -> int:
     """
     Kết hợp:
-      - rain_factor ∈ [0..1] từ mưa hiệu dụng 1h/3h
-      - vuln ∈ [0.1..1] từ relief
-      - risk_cont = rain_factor^1.2 * (0.3 + 0.7 * vuln)
-      - risk_score = round(risk_cont * 5) ∈ [0..5]
+      - rain_band: chủ đạo (0.70)
+      - relief_band (điểm trũng): quan trọng (0.20)
+      - elev_band (độ cao tuyệt đối thấp): phụ (0.10)
+      - slope_pen: giảm nhẹ 0..2
+
+    Output 0..4
     """
-    vuln = _vulnerability_from_relief(relief_m)
-    rain_f = _rain_factor(eff_rain_1h, eff_rain_3h)
+    rain_band = int(_clamp(rain_band, 0, 4))
+    relief_band = int(_clamp(relief_band, 0, 4))
+    elev_band = int(_clamp(elev_band, 0, 4))
+    slope_pen = int(_clamp(slope_pen, 0, 2))
 
-    base = 0.3 + 0.7 * vuln  # [0.3..1.0]
-    risk_cont = (rain_f ** 1.2) * base
-    risk_cont = max(0.0, min(1.0, risk_cont))
-
-    score = int(round(risk_cont * 5))
-    score = max(0, min(5, score))
-    return score
-
-
-    def _risk_score_to_level(score: int) -> str:
-        if score >= 5:
-            return "VERY_HIGH"
-        elif score >= 4:
-            return "HIGH"
-        elif score >= 2:
-            return "MODERATE"
-        elif score >= 1:
-            return "LOW"
-        else:
-            return "NONE"
+    raw = 0.70 * rain_band + 0.20 * relief_band + 0.10 * elev_band
+    score = int(round(raw))
+    score = score - slope_pen
+    return int(_clamp(score, 0, 4))
 
 
+# =========================
+# DEM sampling wrapper (never crash API)
+# =========================
+def _try_sample_dem(lat: float, lon: float):
+    """
+    Returns: (elev_m|None, relief_local_m|None, slope_like_m|None)
+    slope_like: lấy 4 điểm xung quanh, đo max(|dz|) làm proxy dốc.
+    """
+    try:
+        elev = dem_utils.sample_elevation(lat, lon)
+        relief = dem_utils.sample_relief_local(lat, lon, half_size_px=15)
+
+        # Nếu không có elev thì không tính slope_like
+        if elev is None:
+            return None, relief, None
+
+        # Lấy offset nhỏ theo độ (xấp xỉ), đủ dùng làm proxy
+        # 0.01 deg ~ 1.1km theo vĩ độ (gần VN)
+        d = 0.01
+        e_n = dem_utils.sample_elevation(lat + d, lon)
+        e_s = dem_utils.sample_elevation(lat - d, lon)
+        e_e = dem_utils.sample_elevation(lat, lon + d)
+        e_w = dem_utils.sample_elevation(lat, lon - d)
+
+        diffs = []
+        for ex in (e_n, e_s, e_e, e_w):
+            if ex is None:
+                continue
+            diffs.append(abs(float(ex) - float(elev)))
+
+        slope_like = max(diffs) if diffs else None
+        return elev, relief, slope_like
+    except Exception:
+        # Thiếu rasterio/pyproj, thiếu file DEM, lỗi CRS... => bỏ terrain
+        return None, None, None
+
+
+# =========================
+# View
+# =========================
 def flood_risk_latest(request):
-    """
-    GET /api/obs/flood_risk_latest
-
-    Bản nâng cấp:
-      - Dùng mưa 1h/3h như cũ (weather_hourly_obs, source='openmeteo')
-      - Thêm địa hình tương đối (relief_local) từ DEM quanh từng trạm
-      - Không mưa tại điểm -> risk = 0 (NONE)
-      - Có mưa tại điểm -> risk = f(mưa hiệu dụng, relief)
-    """
+    now_utc = timezone.now().astimezone(dt_timezone.utc)
+    now_hour = now_utc.replace(minute=0, second=0, microsecond=0)
 
     with connection.cursor() as cur:
         cur.execute(
             """
-            WITH latest AS (
-              SELECT
-                MAX(valid_at) AS latest_valid_at
-              FROM public.weather_hourly_obs
-              WHERE source = 'openmeteo'
+            WITH
+            params AS (
+              SELECT %s::timestamptz AS t
             ),
-            rain AS (
+            hours AS (
+              SELECT generate_series(
+                (SELECT t FROM params) - interval '6 hour',
+                (SELECT t FROM params),
+                interval '1 hour'
+              ) AS valid_at
+            ),
+            grid AS (
+              SELECT id, lat, lon
+              FROM public.locations
+              WHERE active = true
+            ),
+            merged AS (
               SELECT
-                w.location_id,
-                l.latest_valid_at,
-                SUM(
-                  CASE
-                    WHEN w.valid_at >= l.latest_valid_at - interval '1 hour'
-                         AND w.valid_at <= l.latest_valid_at
-                    THEN COALESCE(w.precip_mm, 0)
-                    ELSE 0
-                  END
-                ) AS rain_1h,
-                SUM(
-                  CASE
-                    WHEN w.valid_at >= l.latest_valid_at - interval '3 hour'
-                         AND w.valid_at <= l.latest_valid_at
-                    THEN COALESCE(w.precip_mm, 0)
-                    ELSE 0
-                  END
-                ) AS rain_3h
-              FROM public.weather_hourly_obs w
-              CROSS JOIN latest l
-              WHERE w.source = 'openmeteo'
-                AND l.latest_valid_at IS NOT NULL
-                AND w.valid_at >= l.latest_valid_at - interval '3 hour'
-                AND w.valid_at <= l.latest_valid_at
-              GROUP BY w.location_id, l.latest_valid_at
+                g.id AS location_id,
+                g.lat, g.lon,
+                h.valid_at,
+                GREATEST(COALESCE(o.precip_mm, f.precip_mm, 0.0), 0.0) AS precip_mm
+              FROM grid g
+              CROSS JOIN hours h
+              LEFT JOIN public.weather_hourly_obs o
+                ON o.location_id = g.id
+               AND o.source = 'openmeteo'
+               AND o.valid_at = h.valid_at
+              LEFT JOIN public.weather_hourly_fcst f
+                ON f.location_id = g.id
+               AND f.valid_at = h.valid_at
+            ),
+            agg AS (
+              SELECT
+                m.location_id, m.lat, m.lon,
+                (SELECT t FROM params) AS valid_at,
+                SUM(CASE WHEN (SELECT t FROM params) - m.valid_at <= interval '1 hour' THEN m.precip_mm ELSE 0 END) AS rain_1h_mm,
+                SUM(CASE WHEN (SELECT t FROM params) - m.valid_at <= interval '3 hour' THEN m.precip_mm ELSE 0 END) AS rain_3h_mm,
+                SUM(CASE WHEN (SELECT t FROM params) - m.valid_at <= interval '6 hour' THEN m.precip_mm ELSE 0 END) AS rain_6h_mm
+              FROM merged m
+              GROUP BY m.location_id, m.lat, m.lon
             )
             SELECT
-              loc.id,
-              loc.lat,
-              loc.lon,
-              r.latest_valid_at,
-              r.rain_1h,
-              r.rain_3h
-            FROM rain r
-            JOIN public.locations loc
-              ON loc.id = r.location_id
-            ORDER BY r.latest_valid_at DESC, loc.lat, loc.lon;
-            """
+              location_id, lat, lon, valid_at,
+              rain_1h_mm, rain_3h_mm, rain_6h_mm
+            FROM agg
+            ORDER BY lat, lon;
+            """,
+            [now_hour],
         )
         rows = cur.fetchall()
 
-    if not rows:
-        return JsonResponse({"count": 0, "data": []})
+    out = []
+    for (
+        location_id, lat, lon, valid_at,
+        rain_1h_mm, rain_3h_mm, rain_6h_mm
+    ) in rows:
+        r1 = _safe_float(rain_1h_mm, 0.0)
+        r3 = _safe_float(rain_3h_mm, 0.0)
+        r6 = _safe_float(rain_6h_mm, 0.0)
 
-    points = []
-    for row in rows:
-        loc_id = str(row[0])
-        lat = float(row[1])
-        lon = float(row[2])
-        latest_valid_at = row[3]  # datetime
-        rain_1h = float(row[4] or 0.0)
-        rain_3h = float(row[5] or 0.0)
+        eff1 = _effective_rain_1h(r1)
+        eff3 = _effective_rain_3h(r1, r3)
+        eff6 = _effective_rain_6h(r1, r3, r6)
 
-        points.append(
-            {
-                "location_id": loc_id,
-                "lat": lat,
-                "lon": lon,
-                "valid_at_dt": latest_valid_at,
-                "rain_1h_mm": rain_1h,
-                "rain_3h_mm": rain_3h,
-            }
-        )
+        rain_band = _rain_band_from_eff6(eff6)
 
-    _add_neighborhood_rain(points, radius_km=20.0, neighbor_weight=0.5)
+        # DEM features (no DB required)
+        elev_m, relief_local_m, slope_like_m = _try_sample_dem(float(lat), float(lon))
 
-    data = []
-    for p in points:
-        loc_id = p["location_id"]
-        lat = p["lat"]
-        lon = p["lon"]
-        latest_valid_at_dt = p["valid_at_dt"]
-        rain_1h = p["rain_1h_mm"]
-        rain_3h = p["rain_3h_mm"]
-        eff_rain_1h = p.get("eff_rain_1h_mm", rain_1h)
-        eff_rain_3h = p.get("eff_rain_3h_mm", rain_3h)
-
-        # Không mưa tại điểm -> nguy cơ = 0 tuyệt đối
-        if rain_1h <= 0.0 and rain_3h <= 0.0:
-            score = 0
-            level = "NONE"
-            relief_m = sample_relief_local(lat, lon)  # chỉ để debug / hiển thị thêm
+        if relief_local_m is None:
+            relief_band = 0
         else:
-            relief_m = sample_relief_local(lat, lon)
-            score = _combine_rain_relief_to_score(relief_m, eff_rain_1h, eff_rain_3h)
-            level = _risk_score_to_level(score)
+            relief_band = _terrain_band_from_relief_local(relief_local_m)
 
-        data.append(
-            {
-                "location_id": loc_id,
-                "lat": lat,
-                "lon": lon,
-                "valid_at": latest_valid_at_dt.isoformat()
-                if latest_valid_at_dt is not None
-                else None,
-                "relief_m": relief_m,
-                "rain_1h_mm": rain_1h,
-                "rain_3h_mm": rain_3h,
-                "eff_rain_1h_mm": eff_rain_1h,
-                "eff_rain_3h_mm": eff_rain_3h,
-                "risk_score": score,
-                "risk_level": level,
-            }
-        )
+        if elev_m is None:
+            elev_band = 0
+        else:
+            elev_band = _elevation_band(elev_m)
 
-    resp = JsonResponse({"count": len(data), "data": data})
-    resp["Cache-Control"] = "public, max-age=60"
-    return resp
+        slope_pen = _slope_like_penalty(slope_like_m) if slope_like_m is not None else 0
+
+        score = _combined_risk_score(rain_band, relief_band, elev_band, slope_pen)
+        level = RISK_LEVELS[int(score)]
+
+        # IMPORTANT: giữ output giống format cũ để FE không đổi
+        out.append({
+            "location_id": str(location_id),
+            "lat": float(lat),
+            "lon": float(lon),
+            "valid_at": valid_at.isoformat(),
+
+            # Giữ tên relief_m như cũ, nhưng giá trị là relief_local (m)
+            "relief_m": None if relief_local_m is None else float(relief_local_m),
+
+            "rain_1h_mm": float(r1),
+            "rain_3h_mm": float(r3),
+            "eff_rain_1h_mm": float(eff1),
+            "eff_rain_3h_mm": float(eff3),
+
+            "risk_score": int(score),
+            "risk_level": level,
+        })
+
+    return JsonResponse({"count": len(out), "data": out})

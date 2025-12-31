@@ -8,3 +8,13 @@ __pycache__/
 # Bỏ file môi trường riêng
 .env
 backend/data/*.tif
+
+# Cài venv:
+python -m venv venv 
+hoac py -m venv venv
+venv\Scripts\Activate
+pip install -r requirements.txt
+
+# Chạy server
+venv\Scripts\Activate
+python manage.py runserver 0.0.0.0:8000

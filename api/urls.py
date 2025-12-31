@@ -9,10 +9,13 @@ from .views_alerts import obs_summary
 from .views_overview import obs_overview
 from . import views_flood
 from . import views_fcst
+from .views_daily import daily_summary  # <- THÊM DÒNG NÀY
+
 
 urlpatterns = [
     path("obs/latest", latest_snapshot),
     path("obs/timeseries/<uuid:location_id>", merged_timeseries),
+    path("obs/daily/<uuid:location_id>", daily_summary),  # <- THÊM ROUTE DAILY
     path("obs/nearest", nearest_point),
     path("obs/summary/<uuid:location_id>", obs_summary),
     path("obs/overview", obs_overview),
