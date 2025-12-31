@@ -126,8 +126,5 @@ Server sẽ hoạt động tại: `http://127.0.0.1:8000`
 
 * **Ngọ Đức Duy** - *Backend Developer*
 * **Đồ án tốt nghiệp 2025** - Học viện Công nghệ Bưu chính Viễn thông (PTIT)
-
-<div align="center">
-Give a ⭐️ if you found this project helpful!
 </div>
 
