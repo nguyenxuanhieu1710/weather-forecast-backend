@@ -1,3 +1,4 @@
+
 <div align="center">
   <img src="https://cdn-icons-png.flaticon.com/512/2165/2165061.png" width="100" />
   <h1>🌪️ Vietnam Weather Forecast Backend</h1>
@@ -67,3 +68,69 @@ weather-forecast-backend/
 ├── manage.py             # File điều khiển Django
 ├── requirements.txt      # Danh sách thư viện phụ thuộc
 └── README.md             # Tài liệu hướng dẫn
+
+```
+
+## ⚙️ Hướng dẫn cài đặt (Installation)
+
+Để chạy backend ở môi trường local, vui lòng thực hiện các bước sau:
+
+**Bước 1: Clone dự án**
+
+```bash
+git clone [https://github.com/nguyenxuanhieu1710/weather-forecast-backend.git](https://github.com/nguyenxuanhieu1710/weather-forecast-backend.git)
+cd weather-forecast-backend
+
+```
+
+**Bước 2: Tạo môi trường ảo (Virtual Environment)**
+
+```bash
+# Windows
+python -m venv venv
+.\venv\Scripts\activate
+
+# MacOS/Linux
+python3 -m venv venv
+source venv/bin/activate
+
+```
+
+**Bước 3: Cài đặt thư viện**
+*Lưu ý: Máy cần cài đặt sẵn GDAL và PROJ (thư viện C++ cho GIS).*
+
+```bash
+pip install -r requirements.txt
+
+```
+
+**Bước 4: Cấu hình Database**
+
+1. Tạo Database trong PostgreSQL.
+2. Kích hoạt PostGIS extension: `CREATE EXTENSION postgis;`
+3. Cập nhật thông tin DB trong file `settings.py` hoặc `.env`.
+
+**Bước 5: Chạy Server**
+
+```bash
+python manage.py migrate
+python manage.py runserver
+
+```
+
+Server sẽ hoạt động tại: `http://127.0.0.1:8000`
+
+---
+
+## 🤝 Tác giả (Author)
+
+* **Ngọ Đức Duy** - *Backend Developer*
+* **Đồ án tốt nghiệp 2025** - Học viện Công nghệ Bưu chính Viễn thông (PTIT)
+
+<div align="center">
+Give a ⭐️ if you found this project helpful!
+</div>
+
+```
+
+```
