@@ -20,22 +20,31 @@
 
 Đây là **Backend Server** đóng vai trò trái tim của hệ thống "Theo dõi, dự báo và cảnh báo thiên tai tại Việt Nam". Hệ thống này chịu trách nhiệm thu thập dữ liệu khí tượng phức tạp từ các nguồn quốc tế, xử lý tính toán và cung cấp API chuẩn RESTful cho cả Website và Mobile App.
 
-Dự án tập trung vào việc xử lý dữ liệu không gian (Geospatial Data) và dữ liệu chuỗi thời gian (Time-series) để đưa ra các dự báo chính xác và cảnh báo sớm.
+Dự án tập trung vào việc xử lý **dữ liệu không gian (Geospatial Data)** và **dữ liệu chuỗi thời gian (Time-series)** quy mô lớn để đưa ra các dự báo chính xác và cảnh báo sớm thiên tai.
 
 ## 🚀 Tính năng chính (Key Features)
 
-* **🌐 Automated Data Crawling:**
-    * Tự động thu thập dữ liệu **GFS (Global Forecast System)** và **GEFS** từ máy chủ NOAA (Mỹ) theo chu kỳ 6 giờ/lần.
-    * Xử lý các file định dạng phức tạp như `NetCDF`, `GRIB2`.
-* **⚙️ Data Processing Engine:**
-    * Sử dụng thư viện `Xarray` và `NetCDF4` để nội suy và trích xuất dữ liệu.
-    * Tính toán lượng mưa tích lũy, nhiệt độ, độ ẩm, hướng gió và áp suất cho toàn lãnh thổ Việt Nam.
-* **⚠️ Disaster Warning System:**
-    * Thuật toán phân tích ngưỡng mưa (Precipitation Thresholds) để đưa ra các mức cảnh báo lũ quét và sạt lở đất.
-    * Phân vùng rủi ro dựa trên địa hình và lịch sử dữ liệu.
-* **📡 RESTful API Service:**
-    * Cung cấp endpoints tối ưu cho Frontend (ReactJS) và Mobile (React Native).
-    * Hỗ trợ truy vấn dữ liệu theo tọa độ (Lat/Lon) và theo khu vực hành chính.
+### 1. Thu thập dữ liệu tự động (Automated Data Crawling)
+* **Nguồn dữ liệu:** Kết nối trực tiếp với máy chủ của **NOAA (National Oceanic and Atmospheric Administration)**.
+* **Mô hình:** Sử dụng dữ liệu **GFS (Global Forecast System)** và **GEFS** cho độ chính xác cao.
+* **Định dạng:** Xử lý các file dữ liệu khí tượng phức tạp dạng `.nc` (NetCDF) và `.grib2`.
+* **Lịch trình:** Tự động chạy tác vụ (Cronjob) cập nhật dữ liệu mới mỗi 6 giờ/lần.
+
+### 2. Bộ xử lý trung tâm (Data Processing Engine)
+* **Công nghệ:** Sử dụng `Xarray`, `Pandas` và `NetCDF4` để đọc và nội suy dữ liệu lưới (Grid data).
+* **Tính toán:**
+    * Tính tổng lượng mưa tích lũy (Precipitation accumulation).
+    * Phân tích hướng gió (U-wind, V-wind) và tốc độ gió.
+    * Trích xuất nhiệt độ, độ ẩm, áp suất khí quyển.
+* **Phủ trùm:** Dữ liệu bao phủ toàn bộ lãnh thổ Việt Nam và vùng Biển Đông.
+
+### 3. Hệ thống cảnh báo (Warning System)
+* Phân tích ngưỡng mưa (Thresholds) để đưa ra các mức cảnh báo nguy cơ lũ quét, sạt lở đất.
+* Cung cấp API cảnh báo thời gian thực dựa trên vị trí người dùng.
+
+### 4. API Service
+* **RESTful API:** Cung cấp endpoints chuẩn cho Frontend và Mobile App.
+* **Geo-Query:** Hỗ trợ truy vấn dữ liệu thời tiết theo tọa độ GPS (Latitude/Longitude).
 
 ## 🛠️ Công nghệ sử dụng (Tech Stack)
 
@@ -44,14 +53,17 @@ Dự án tập trung vào việc xử lý dữ liệu không gian (Geospatial Da
 | **Language** | Python 3.9+ | Ngôn ngữ xử lý chính. |
 | **Framework** | Django & DRF | Xây dựng API và quản trị hệ thống. |
 | **Database** | PostgreSQL + PostGIS | Lưu trữ dữ liệu không gian (GIS) và Time-series. |
-| **Async Tasks** | Celery + Redis | Xử lý tác vụ nền (Background jobs) và hàng đợi cào dữ liệu. |
+| **Async Tasks** | Celery + Redis | Xử lý tác vụ nền (Background jobs) và hàng đợi. |
 | **Data Science** | Pandas, Numpy, Xarray | Thư viện tính toán khoa học và xử lý mảng nhiều chiều. |
 
-## ⚙️ Cài đặt và Triển khai (Installation)
+## 📂 Cấu trúc thư mục (Folder Structure)
 
-Để chạy backend ở môi trường local, vui lòng thực hiện các bước sau:
-
-**Bước 1: Clone dự án**
 ```bash
-git clone [https://github.com/nguyenxuanhieu1710/weather-forecast-backend.git](https://github.com/nguyenxuanhieu1710/weather-forecast-backend.git)
-cd weather-forecast-backend
+weather-forecast-backend/
+├── api/                  # Các API Views & Serializers
+├── core/                 # Logic xử lý dữ liệu chính (Crawl, Process)
+├── data/                 # Thư mục lưu tạm file NetCDF/GRIB tải về
+├── weather_backend/      # Cấu hình dự án (Settings, URLs)
+├── manage.py             # File điều khiển Django
+├── requirements.txt      # Danh sách thư viện phụ thuộc
+└── README.md             # Tài liệu hướng dẫn
