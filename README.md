@@ -131,6 +131,3 @@ Server sẽ hoạt động tại: `http://127.0.0.1:8000`
 Give a ⭐️ if you found this project helpful!
 </div>
 
-```
-
-```
